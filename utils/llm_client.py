@@ -20,7 +20,7 @@ except ImportError:
     groq_client = None
 
 try:
-    import google.generativeai as genai
+    import google.genai as genai
     GEMINI_AVAILABLE = True
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     if gemini_api_key:

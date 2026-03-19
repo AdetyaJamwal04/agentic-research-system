@@ -11,5 +11,5 @@ rank-bm25
 PyPDF2
 fastapi
 uvicorn[standard]
-google-generativeai
+google-genai
 python-multipart
