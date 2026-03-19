@@ -1,0 +1,499 @@
+================================================================================
+                  AGENTIC RESEARCH SYSTEM — SYSTEM ARCHITECTURE
+                              Active Components Only
+================================================================================
+
+OVERVIEW
+--------
+An AI-powered research agent that takes a user query, searches the web, 
+retrieves from local documents (uploaded PDFs), extracts claims, validates 
+evidence, and produces cited answers across multi-turn conversations.
+
+Supports two frontends:
+  • Web UI at http://localhost:8000  (chat interface with sessions)
+  • CLI via `python main.py`
+
+
+================================================================================
+1. ENTRY POINTS
+================================================================================
+
+┌─ app.py ──────────────────────────────────────────────────────────────────────┐
+│  FastAPI server. Exposes:                                                     │
+│    POST   /api/sessions              → Create session                        │
+│    GET    /api/sessions              → List all sessions                      │
+│    GET    /api/sessions/{id}         → Get session + messages                 │
+│    PUT    /api/sessions/{id}         → Rename session                         │
+│    DELETE /api/sessions/{id}         → Delete session + messages              │
+│    POST   /api/sessions/{id}/upload  → Upload PDF scoped to session           │
+│    WS     /ws/research               → Session-aware streaming research       │
+│    POST   /api/research              → Stateless research (legacy)            │
+│    POST   /api/upload                → Stateless PDF upload (legacy)          │
+│    GET    /api/history               → Research history                       │
+│    GET    /api/ltm                   → Long-term memory contents              │
+│    DELETE /api/history|memory|ltm    → Clear stored data                      │
+│    GET    /                          → Serve chat UI                          │
+│                                                                               │
+│  WebSocket flow:                                                              │
+│    1. Client sends {query, session_id, max_iterations, use_memory}           │
+│    2. Server builds conversation context from SessionManager                  │
+│    3. Streams pipeline steps as JSON events                                   │
+│    4. Saves assistant reply + metadata back to the session                    │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ main.py ─────────────────────────────────────────────────────────────────────┐
+│  CLI interface. Provides an interactive REPL:                                 │
+│    • Type a query → runs the full pipeline                                    │
+│    • `upload <path.pdf>` → ingests a PDF                                     │
+│    • `history` → shows past queries                                           │
+│    • `ltm` → shows long-term memory                                           │
+│    • `clear` → resets memory                                                  │
+│  Runs `run_research()` synchronously with console output.                    │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ config.py ───────────────────────────────────────────────────────────────────┐
+│  Centralized settings. Loaded by most modules.                               │
+│    API Keys:      GROQ_API_KEY, TAVILY_API_KEY (from .env)                   │
+│    Models:        DEFAULT_MODEL = llama-3.3-70b-versatile                    │
+│                   EMBEDDING_MODEL = all-MiniLM-L6-v2                         │
+│    Retrieval:     MAX_QUERIES_PER_TASK=6, MAX_RETRIEVED_DOCS=20              │
+│                   RERANK_TOP_K=3, CHUNK_SIZE=500, CHUNK_OVERLAP=50           │
+│    Critic:        CRITIC_THRESHOLD=8, MAX_RETRY_ITERATIONS=3                 │
+│    Paths:         DATA_DIR, DB_PATH, DOCUMENTS_DIR, CHROMA_DIR, BM25_PATH   │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+2. PIPELINE — pipelines/research_pipeline.py
+================================================================================
+
+run_research(query, max_iterations=3, use_memory=True, stream_callback=None,
+             conversation_context="", local_only=False) → dict
+
+Executes 12 pipeline steps in sequence. Each step is wrapped in try/except
+with graceful degradation. Step timings are tracked and streamed.
+
+  Step 0:  Memory Load
+           → EvidencePool() — fresh per query
+           → ResearchHistory() — SQLite history
+           → LongTermMemory.retrieve_relevant(query) — ChromaDB semantic search
+
+  Step 1:  Query Analysis
+           → analyse_query(query) → {refined_query, intent, entities, ...}
+
+  Step 1.5: Premise Validation
+           → validate_premise(analysis) → {premise_status, correction, ...}
+           If premise is false, overrides `effective_query` for rest of pipeline
+
+  Step 2:  Planning
+           → create_plan(analysis) → {tasks: [{task_id, description}, ...]}
+
+  Step 3:  Query Generation
+           → generate_queries(plan) → {task_queries: [{task_id, queries}, ...]}
+
+  Step 4:  Retrieval
+           → retrieve_documents(queries, local_only) → list of tagged docs
+           Uses web_search (Tavily) + hybrid_search (ChromaDB + optional BM25)
+           If local_only=True: skips web search, retrieves 5 local docs
+
+  Step 5:  Domain Filter
+           → filter_documents(query, docs) → filtered list
+
+  Step 6:  Evidence Pool
+           → pool.add(docs) — deduplicates and stores
+
+  Step 7:  Reranking
+           → rerank_documents(query, docs) → top-K scored docs
+
+  Step 8:  Context Compression
+           → compress_context(query, docs) → compressed strings
+
+  Step 9:  Claim Extraction
+           → extract_claims(query, evidence) → [{claim, confidence, ...}]
+
+  Step 10: Evidence Synthesis
+           → synthesize_evidence(query, evidence) → {evidence_brief, ...}
+
+  Step 11: Reasoning + Critic Loop (up to max_iterations)
+           → generate_answer(query, evidence, conversation_context) → string
+           → critique_answer(query, answer) → {verdict, score, missing_aspects}
+           If insufficient → dynamic_planner revises plan, retrieves more
+
+  Step 12: Persist
+           → research_history.log_query(...)
+           → ltm.save_verified_claims(...) — quality-gated (critic approved only)
+
+
+run_research_stream(query, max_iterations, use_memory, conversation_context)
+  → async generator, runs run_research in a thread, yields events via queue
+
+
+================================================================================
+3. AGENTS — agents/
+================================================================================
+
+Each agent is a stateless function that calls the LLM and returns structured
+output. All use `utils.llm_client` for Groq→Gemini failover.
+
+┌─────────────────────────┬──────────────────────────────────────────────────────┐
+│ File                    │ Function & Role                                      │
+├─────────────────────────┼──────────────────────────────────────────────────────┤
+│ query_analyzer.py       │ analyse_query(query) → dict                         │
+│                         │ Extracts intent, entities, sub-questions,            │
+│                         │ refined query. Returns JSON via get_json_response.  │
+│                         │                                                      │
+│ premise_validator.py    │ validate_premise(analysis) → dict                   │
+│                         │ Checks if the query's premise is factually valid.   │
+│                         │ Returns {premise_status, correction, corrected_q}.  │
+│                         │                                                      │
+│ planner.py              │ create_plan(analysis) → dict                        │
+│                         │ Generates a multi-task research plan.               │
+│                         │ Returns {tasks: [{task_id, description}]}.          │
+│                         │                                                      │
+│ query_generator.py      │ generate_queries(plan) → dict                       │
+│                         │ Creates specific search queries per task.           │
+│                         │ Returns {task_queries: [{task_id, queries}]}.       │
+│                         │                                                      │
+│ retriever_agent.py      │ retrieve_documents(plan_queries, local_only) → list │
+│                         │ Runs web search (Tavily) + hybrid local search.     │
+│                         │ If local_only=True: skips web, retrieves 5 local.   │
+│                         │ Tags each doc with source_type, url, title.         │
+│                         │ Handles async→sync bridging with thread pool.        │
+│                         │                                                      │
+│ relevance_filter.py     │ filter_documents(query, docs) → list                │
+│                         │ LLM-powered domain filter. Removes off-topic docs.  │
+│                         │                                                      │
+│ evidence_agent.py       │ synthesize_evidence(query, evidence) → dict          │
+│                         │ Identifies themes, conflicts, gaps in evidence.      │
+│                         │ format_synthesis_for_reasoning(synth) → string.      │
+│                         │                                                      │
+│ reasoning_agent.py      │ generate_answer(query, evidence,                    │
+│                         │                 conversation_context="") → string   │
+│                         │ Generates cited answer from evidence.               │
+│                         │ Accepts prior Q&A context for multi-turn support.   │
+│                         │ Routes through llm_client (Groq → Gemini failover). │
+│                         │                                                      │
+│ critic_agent.py         │ critique_answer(query, answer) → dict               │
+│                         │ Scores answer quality (1-10). Returns verdict        │
+│                         │ ("sufficient"/"insufficient"), missing_aspects.     │
+│                         │ Drives the retry loop.                               │
+└─────────────────────────┴──────────────────────────────────────────────────────┘
+
+
+================================================================================
+4. RETRIEVAL — retrieval/
+================================================================================
+
+┌─────────────────────────┬──────────────────────────────────────────────────────┐
+│ File                    │ Function & Role                                      │
+├─────────────────────────┼──────────────────────────────────────────────────────┤
+│ vector_retriever.py     │ vector_retrieve(query, k) → list                    │
+│                         │ Dense search via ChromaDB (cosine similarity).      │
+│                         │ Returns [{content, source, chunk_id, score}].       │
+│                         │                                                      │
+│                         │ ingest_documents(docs) → int                        │
+│                         │ Ingests PDF chunks into ChromaDB.                   │
+│                         │ Uses ChromaDB's default embedding (MiniLM).         │
+│                         │                                                      │
+│ bm25_retriever.py       │ bm25_retrieve(query, k) → list                     │
+│                         │ Sparse keyword search using pickled BM25 index.     │
+│                         │ Index stored at data/bm25_index.pkl.                │
+│                         │                                                      │
+│ hybrid_retriever.py     │ hybrid_search(query, k) → list                     │
+│                         │ Combines dense + sparse with Reciprocal Rank Fusion.│
+│                         │ Falls back to vector-only if BM25 index absent.     │
+│                         │ Returns empty if no ChromaDB index exists.          │
+│                         │                                                      │
+│ reranker.py             │ rerank_documents(query, docs) → list                │
+│                         │ LLM-based reranking. Scores each doc, returns top-K.│
+│                         │ Score-aware: skips docs below quality threshold.    │
+│                         │                                                      │
+│ context_compressor.py   │ compress_context(query, docs) → list                │
+│                         │ LLM-based compression. Extracts relevant passages.  │
+│                         │ Routes through llm_client for failover.             │
+│                         │                                                      │
+│ web_retriever.py        │ (Thin wrapper, imported by retriever_agent)          │
+│                         │ Currently delegates to tools/web_search.py.         │
+└─────────────────────────┴──────────────────────────────────────────────────────┘
+
+
+================================================================================
+5. MEMORY — memory/
+================================================================================
+
+┌─────────────────────────┬──────────────────────────────────────────────────────┐
+│ File                    │ Class/Function & Role                                │
+├─────────────────────────┼──────────────────────────────────────────────────────┤
+│ database.py             │ get_connection() → sqlite3.Connection               │
+│                         │ SQLite database at data/research.db.                │
+│                         │ Auto-creates tables on first call:                  │
+│                         │   • claims — legacy claim storage                   │
+│                         │   • research_history — query log                    │
+│                         │   • evidence_snapshots — evidence data              │
+│                         │   • sessions — chat sessions (id, title, dates)     │
+│                         │   • messages — session messages (role, content, etc)│
+│                         │ WAL mode enabled for concurrency.                   │
+│                         │                                                      │
+│ session_manager.py      │ class SessionManager                                 │
+│                         │   create_session(title) → session_id               │
+│                         │   list_sessions() → [{id, title, dates}]           │
+│                         │   get_session(id) → {session + messages}            │
+│                         │   rename_session(id, title)                         │
+│                         │   delete_session(id) — cascades to messages         │
+│                         │   add_message(session_id, role, content, metadata)  │
+│                         │   get_messages(session_id) → list                   │
+│                         │   build_context(session_id, limit=10) → string     │
+│                         │     Formats last 10 messages as conversation context│
+│                         │   auto_title(session_id, first_query)              │
+│                         │     Sets title from first 50 chars of query         │
+│                         │                                                      │
+│ research_history.py     │ class ResearchHistory                                │
+│                         │   log_query(query, claims_found, verdict)           │
+│                         │   has_prior_research(query) → bool                  │
+│                         │   get_history() → list of past queries              │
+│                         │                                                      │
+│ evidence_pool.py        │ class EvidencePool                                   │
+│                         │ Query-scoped evidence store. Fresh per pipeline run.│
+│                         │   add(docs) — stores tagged documents               │
+│                         │   add_claims(claims) — stores extracted claims       │
+│                         │   get_contents() → list of doc texts                │
+│                         │   get_claims() → list of claims                     │
+│                         │   get_sources() → list of source metadata           │
+│                         │   format_for_reasoning() → numbered evidence string │
+│                         │   format_claims_for_reasoning() → formatted claims  │
+│                         │   next_iteration() — marks iteration boundary       │
+│                         │                                                      │
+│ long_term_memory.py     │ class LongTermMemory                                 │
+│                         │ Persistent across sessions. Uses ChromaDB at        │
+│                         │ data/ltm_chroma_db.                                 │
+│                         │   retrieve_relevant(query, top_k) → list            │
+│                         │     Semantic search, distance threshold < 0.5       │
+│                         │   format_for_context(claims) → string               │
+│                         │   save_verified_claims(claims, query, verdict)      │
+│                         │     Quality-gated: only saves if verdict=sufficient  │
+│                         │     Confidence threshold: 0.8                       │
+│                         │     Deduplicates via semantic similarity < 0.05     │
+│                         │   summary() → string count                          │
+└─────────────────────────┴──────────────────────────────────────────────────────┘
+
+
+================================================================================
+6. EVIDENCE & PLANNING
+================================================================================
+
+┌─────────────────────────┬──────────────────────────────────────────────────────┐
+│ File                    │ Function & Role                                      │
+├─────────────────────────┼──────────────────────────────────────────────────────┤
+│ evidence/               │                                                      │
+│   claim_extractor.py    │ extract_claims(query, evidence) → list              │
+│                         │ LLM-based. Extracts structured claims with          │
+│                         │ confidence scores and mechanisms from evidence text. │
+│                         │ Returns [{claim, mechanism, confidence, source_id}].│
+│                         │                                                      │
+│ planning/               │                                                      │
+│   dynamic_planner.py    │ revise_plan(query, missing_aspects, tasks) → dict   │
+│                         │ Called during critic loop when answer is insufficient│
+│                         │ Generates new tasks targeting missing information.  │
+│                         │ Returns {tasks: [{task_id, description}]}.          │
+└─────────────────────────┴──────────────────────────────────────────────────────┘
+
+
+================================================================================
+7. TOOLS
+================================================================================
+
+┌─────────────────────────┬──────────────────────────────────────────────────────┐
+│ File                    │ Function & Role                                      │
+├─────────────────────────┼──────────────────────────────────────────────────────┤
+│ web_search.py           │ async search_web(query) → list                      │
+│                         │ Calls Tavily API for web search results.            │
+│                         │ Returns [{content, url, title}].                    │
+│                         │                                                      │
+│ file_loader.py          │ process_pdf(filepath, chunk_size, overlap) → list   │
+│                         │ Extracts text from PDF using PyPDF2.                │
+│                         │ Chunks by word count with configurable overlap.     │
+│                         │ Returns [{content, metadata: {source_id, type}}].   │
+└─────────────────────────┴──────────────────────────────────────────────────────┘
+
+
+================================================================================
+8. UTILITIES — utils/
+================================================================================
+
+┌─────────────────────────┬──────────────────────────────────────────────────────┐
+│ File                    │ Function & Role                                      │
+├─────────────────────────┼──────────────────────────────────────────────────────┤
+│ llm_client.py           │ CENTRALIZED LLM GATEWAY — all agents use this.      │
+│                         │                                                      │
+│                         │ get_llm_response(messages, model, temperature,      │
+│                         │                  max_tokens, response_format) → str │
+│                         │   Strategy:                                          │
+│                         │   1. If Groq in cooldown → skip to Gemini           │
+│                         │   2. Try Groq with 3 retries + exponential backoff  │
+│                         │   3. On 429 → activate 60s cooldown → Gemini        │
+│                         │   4. On other errors → immediate Gemini fallback    │
+│                         │                                                      │
+│                         │ get_json_response(messages, ...) → dict             │
+│                         │   Wrapper that forces JSON output format and parses.│
+│                         │                                                      │
+│                         │ _fallback_to_gemini(messages, ...) → str            │
+│                         │   Translates OpenAI/Groq messages to Gemini format. │
+│                         │   Uses gemini-2.0-flash model.                      │
+│                         │                                                      │
+│                         │ Providers:                                           │
+│                         │   Primary:  Groq (llama-3.3-70b-versatile)          │
+│                         │   Fallback: Google Gemini (gemini-2.0-flash)        │
+└─────────────────────────┴──────────────────────────────────────────────────────┘
+
+
+================================================================================
+9. FRONTEND — templates/index.html
+================================================================================
+
+Single-page chat application served at GET /.
+
+  Components:
+    • Session sidebar      — create, rename, delete, switch sessions
+    • Chat message area    — user/assistant/system message bubbles
+    • Streaming indicator  — live pipeline steps with animated dots
+    • Expandable panels    — sources (linked), claims (color-coded confidence)
+    • Pipeline steps       — green/red dots showing step completion
+    • Input bar            — textarea + 📎 upload + 📄 My Docs toggle + send
+    • My Docs toggle       — activates local_only mode (no web search)
+    • Toast notifications  — non-blocking feedback for uploads/errors
+
+  Session lifecycle:
+    1. Page load → GET /api/sessions → render sidebar
+    2. "+ New Research" → POST /api/sessions → empty chat view
+    3. User types query → WebSocket /ws/research with session_id
+    4. Server streams {type: "step"} events → live pipeline display
+    5. Server sends {type: "complete"} → render full answer + metadata
+    6. First message → auto-title session
+    7. Sidebar refreshes to show updated title
+
+
+================================================================================
+10. DATA STORAGE
+================================================================================
+
+  data/
+    research.db          SQLite — sessions, messages, research_history,
+                         evidence_snapshots, claims (legacy)
+    chroma_db/           ChromaDB — uploaded document vectors
+    ltm_chroma_db/       ChromaDB — long-term memory verified claims
+    bm25_index.pkl       Pickled BM25 index (optional, for hybrid search)
+    documents/           Uploaded PDF files (raw copies)
+
+  All tables/collections are auto-created on first use. Deleting the data/
+  folder resets the system to a clean state.
+
+
+================================================================================
+11. ENVIRONMENT VARIABLES (.env)
+================================================================================
+
+  GROQ_API_KEY        Required — primary LLM provider
+  TAVILY_API_KEY      Required — web search
+  GEMINI_API_KEY      Optional — fallback LLM provider
+
+
+================================================================================
+12. DATA FLOW DIAGRAM
+================================================================================
+
+  User Query
+      │
+      ▼
+  ┌──────────────────┐
+  │  Session Manager  │ ← builds conversation_context from history
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │  Query Analyzer   │ → refined query, intent, entities
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Premise Validator │ → validates factual premises
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │     Planner       │ → multi-task research plan
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Query Generator   │ → search queries per task
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────────────────────┐
+  │         Retriever Agent          │
+  │  ┌──────────┐  ┌──────────────┐  │
+  │  │ Tavily   │  │ Hybrid Search│  │
+  │  │ Web API  │  │ ChromaDB+BM25│  │
+  │  └──────────┘  └──────────────┘  │
+  └────────┬─────────────────────────┘
+           ▼
+  ┌──────────────────┐
+  │  Domain Filter    │ → drops off-topic docs
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │  Evidence Pool    │ → deduplicates, stores
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │    Reranker       │ → LLM-scored top-K docs
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Context Compress  │ → extracts key passages
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Claim Extractor   │ → structured claims with confidence
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ Evidence Synth    │ → themes, conflicts, gaps
+  └────────┬─────────┘
+           ▼
+  ┌─────────────────────────────────────────┐
+  │          Reasoning + Critic Loop         │
+  │  ┌────────────────┐  ┌──────────────┐   │
+  │  │ Reasoning Agent│→ │ Critic Agent  │   │
+  │  │ +conversation  │  │ score ≥ 8?   │   │
+  │  │  context       │  └──────┬───────┘   │
+  │  └────────────────┘    ┌────┴────┐      │
+  │                        │ NO: revise│     │
+  │                        │ plan +    │     │
+  │                        │ re-retrieve│    │
+  │                        └──────────┘      │
+  └────────┬────────────────────────────────┘
+           ▼
+  ┌──────────────────┐
+  │  Persist Results  │ → research_history (SQLite)
+  │                   │ → long_term_memory (ChromaDB, quality-gated)
+  │                   │ → session messages (SQLite)
+  └──────────────────┘
+
+
+================================================================================
+13. STUB FILES (Scaffolded, Not Implemented)
+================================================================================
+
+  The following files exist in the codebase but contain only TODO comments.
+  They are NOT imported or used by any active module:
+
+  agents/          query_rewriter.py, report_agent.py
+  memory/          knowledge_graph.py, session_memory.py
+  tools/           arxiv_search.py, calculator.py, code_executor.py
+  utils/           helpers.py, logger.py, token_counter.py
+  evidence/        citation_mapper.py, evidence_ranker.py
+  planning/        plan_updater.py, task_router.py
+  pipelines/       answer_pipeline.py
+  evaluation/      benchmark_runner.py, confidence_scorer.py,
+                   critic.py, hallucination_checker.py
+  orchestration/   langgraph_flow.py, state_manager.py
+
+  These can be safely deleted without affecting functionality.
+
+================================================================================

@@ -1,0 +1,15 @@
+groq
+langchain
+langgraph
+tavily-python
+qdrant-client
+python-dotenv
+sentence-transformers
+scikit-learn
+chromadb
+rank-bm25
+PyPDF2
+fastapi
+uvicorn[standard]
+google-generativeai
+python-multipart
