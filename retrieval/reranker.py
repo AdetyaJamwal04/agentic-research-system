@@ -1,9 +1,18 @@
 from sentence_transformers import CrossEncoder
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
-model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+_model = None
+
+def _get_model():
+    """Lazy-load the cross-encoder to avoid OOM on startup (Render 512MB limit)."""
+    global _model
+    if _model is None:
+        logger.info("Loading cross-encoder model (first use)...")
+        _model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _model
 
 # Cross-encoder scores are log-odds. Typical range: -10 to +10.
 # Docs below this threshold are considered irrelevant.
@@ -21,7 +30,7 @@ def rerank_documents(query, documents, top_k=5):
 
     try:
         sentence_pairs = [[query, doc] for doc in documents]
-        scores = model.predict(sentence_pairs)
+        scores = _get_model().predict(sentence_pairs)
 
         # Pair, sort, and filter
         ranked = sorted(
