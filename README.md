@@ -36,12 +36,12 @@ User Query
 │  4. Retrieval (Web + Local + BM25)      │
 │  5. Domain Relevance Filtering          │
 │  6. Reranking (Cross-Encoder)           │
-│  7. Reasoning & Synthesis              │
+│  7. Reasoning & Synthesis               │
 │  8. Evidence Extraction                 │
 │  9. Citation Mapping                    │
-│ 10. Critic Evaluation                  │
-│ 11. Iterative Refinement (if needed)   │
-│ 12. Final Answer                       │
+│ 10. Critic Evaluation                   │
+│ 11. Iterative Refinement (if needed)    │
+│ 12. Final Answer                        │
 └─────────────────────────────────────────┘
     │
     ▼
